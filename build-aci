@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Inspired by Abiola Ibrahim <abiola89@gmail.com>
+set -e
+# Import environment variables
+source ./environment
+
+if [ "$EUID" -ne 0 ] ; then
+  echo "This script uses functionality which requires root privileges"
+  exit 1
+fi
+
+if ! command -v $ACBUILD >/dev/null; then
+    echo "acbuild ($ACBUILD) is not executable"
+    exit 1
+fi
+
+if [ -z "$APP" ] ; then
+  echo "Make sure the environment variables are set"
+    exit 1
+fi
+
+# fetch Caddy
+PLUGINS="cors,git,hugo,filemanager,ipfilter,mailout,prometheus,realip,search"
+curl -SL "https://caddyserver.com/download/build?os=${OS}&arch=${ARCH}&features=${PLUGINS}" \
+      | tar --no-same-owner -C bin/ -xz caddy
+
+# fetch Hugo
+HUGO_VERSION=0.18.1
+curl -SL "https://github.com/spf13/hugo/releases/download/v${HUGO_VERSION}/hugo_${HUGO_VERSION}_Linux-64bit.tar.gz"  \
+      | tar --no-same-owner -C bin/ -xz
+mv ./bin/hugo_${HUGO_VERSION}_${OS}_${ARCH}/hugo_${HUGO_VERSION}_${OS}_${ARCH} ./bin/hugo
+rm -rf ./bin/hugo_${HUGO_VERSION}_${OS}_${ARCH}
+
+acbuild --debug begin
+
+# In the event of the script exiting, end the build
+trap "{ export EXT=$?; acbuild --debug end && exit $EXT;}" EXIT
+
+PLUGINS="cors,git,hugo,filemanager,ipfilter,mailout,prometheus,realip,search"
+CONF_PHPINI=/etc/php/php.ini
+CONF_PHPFPM=/etc/php/php-fpm.conf
+
+acbuild --debug set-name sdaros/${APP}
+acbuild --debug annotation add authors "Stefano Da Ros <sdaros@cip.li>"
+acbuild --debug label add version ${VERSION}
+acbuild --debug label add arch ${ARCH}
+acbuild --debug label add os ${OS}
+# Based on alpine
+acbuild --debug dep add quay.io/coreos/alpine-sh
+acbuild --debug run -- apk update
+acbuild --debug run -- apk add --no-cache openssh-client git tar php-fpm curl msmtp
+# Essential php libs
+acbuild --debug run -- apk add --no-cache php-curl php-dom php-gd php-ctype php-zip php-xml php-iconv php-sqlite3 php-mysql php-mysqli php-pgsql php-json php-phar php-openssl php-pdo
+# Allow environment variable access
+acbuild --debug run -- sed -i "s/;clear_env/clear_env/" ${CONF_PHPFPM}
+# Configure php-fpm with more liberal settings
+acbuild --debug run -- sed -i -e "s/output_buffering\s*=\s*4096/output_buffering = Off/g" ${CONF_PHPINI}
+acbuild --debug run -- sed -i -e "s/;cgi.fix_pathinfo=1/cgi.fix_pathinfo=0/g" ${CONF_PHPINI}
+acbuild --debug run -- sed -i -e "s/upload_max_filesize\s*=\s*2M/upload_max_filesize = 1G/g" ${CONF_PHPINI}
+acbuild --debug run -- sed -i -e "s/post_max_size\s*=\s*8M/post_max_size = 1G/g" ${CONF_PHPINI}
+acbuild --debug run -- sed -i -e "s:;\s*session.save_path\s*=\s*\"N;/path\":session.save_path = /tmp:g" ${CONF_PHPINI}
+acbuild --debug run -- sed -i -e "s:;sendmail_path\s*=\s*:sendmail_path = /usr/bin/msmtp -t:g" ${CONF_PHPINI}
+acbuild --debug copy ./bin/caddy /usr/bin/caddy
+acbuild --debug copy ./bin/hugo /usr/bin/hugo
+acbuild --debug port add http tcp 80
+acbuild --debug port add https tcp 443
+acbuild --debug mount add --read-only caddyfile /etc/Caddyfile
+acbuild --debug mount add caddy-dir /root/.caddy
+acbuild --debug mount add html /var/www/html/
+acbuild --debug set-exec -- /usr/bin/caddy --conf /etc/Caddyfile --log stdout
+acbuild --debug write --overwrite ${BUILDDIR}/${RELEASE}.aci
+
